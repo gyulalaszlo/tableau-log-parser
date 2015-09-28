@@ -1,6 +1,10 @@
 (ns tableau-log-convert.core
   (:require [clojure.data.json :as json]
-            [clojure.data.csv :as csv])
+            [clojure.data.csv :as csv]
+            [clojure.java.jdbc :as jdbc]
+
+            [clj-time.format :as tf]
+            [clj-time.coerce :as tc])
   (:gen-class))
 
 
@@ -12,42 +16,77 @@
 
 
 ;; Helper to turn a nested object into a linear structure
-(defn- linearize-row
-  ([row] (linearize-row row nil))
-  ([row base-key]
-   (->> row
-        (mapcat (fn [[k v]]
-                  (let [new-key (if (nil? base-key) k (str base-key SEPARATOR k))]
-                    (cond
-                      (map? v) (linearize-row v new-key)
-                      :else [[new-key v]])))))))
+;(defn- linearize-row
+;  ([row] (linearize-row row nil))
+;  ([row base-key]
+;   (->> row
+;        (mapcat (fn [[k v]]
+;                  (let [new-key (if (nil? base-key) k (str base-key SEPARATOR k))]
+;                    (cond
+;                      (map? v) (linearize-row v new-key)
+;                      :else [[new-key v]])))))))
 
 (defn parse-row
   "Parses a JSON object and returns a linearized representation of it for CSV purposes"
   [row]
-  (->> (json/read-str row)
-       (linearize-row)
-       (into {})))
+  (->> (json/read-str row)))
+;
+;(def DB {:classname   "org.postgresql.Driver"
+;         :subprotocol "postgresql"
+;         :subname     "//localhost:5432/tableau_logs"
+;         :user        "postgres"
+;         :password    "abc12def"})
 
 
+(def ^:private LOG-KEYS ["pid" "tid" "sev" "req" "sess" "site"])
+(def ^:private log-ts-formatter (tf/formatters :date-hour-minute-second-ms))
 
-(defn read-tableau-log [log-file]
-  (let [log-entries (with-open [rdr (clojure.java.io/reader log-file)]
+(defn- select-log-keys [row log-name server-num]
+  (assoc (select-keys row LOG-KEYS)
+    :ts (tc/to-sql-time (tf/parse log-ts-formatter (row "ts")))
+    :user_name (row "user")
+
+    :log_name log-name
+    :server_num (Integer. server-num)))
+
+(defn insert-log-row [dbspec log-name server-num log-rows]
+  (let [inserted-rows (apply jdbc/insert! dbspec :logs (map #(select-log-keys % log-name server-num) log-rows))
+        inserted-ids (map :pk_key inserted-rows)]
+
+    (->> (map (fn [id log-row] [id (log-row "v")]) inserted-ids log-rows)
+
+         (mapcat
+           (fn [[id attrs]]
+             (if (string? attrs)
+               ;; If the value is a string, assoc it with
+               [{:pk_key id
+                 :key    "$content"
+                 :value  attrs}]
+               ;; otherwise map each pair
+               (mapv (fn [[k v]] {:pk_key id
+                                 :key    k
+                                 :value  (if (string? v) v (pr-str v))})
+                    attrs))))
+
+         (apply jdbc/insert! dbspec :keyv ))))
+
+
+(defn read-tableau-log [dbspec log-file]
+  (let [[combined log-name server-num] (re-find #"^([a-zA-Z-]+)_([0-9]+)_" (org.apache.commons.io.FilenameUtils/getBaseName log-file))
+        log-entries (with-open [rdr (clojure.java.io/reader log-file)]
                       (doall
                         (map parse-row (line-seq rdr))))
-        log-keys (->> (mapcat keys log-entries)
-                      (set)
-                      (vec)
-                      (sort))
-        log-rows (mapv (fn [le] (mapv #(get le %) log-keys)) log-entries)]
-    (with-open [out-file (clojure.java.io/writer (str log-file ".csv"))]
-      (csv/write-csv out-file [log-keys])
-      (csv/write-csv out-file log-rows))
+        log-count (count log-entries)]
+    (println  "-> Finished loading -- extracting from" log-count " rows.")
+    (doseq [log-entry-block (partition-all 1000 log-entries)]
+      (println "Inserting " (count log-entry-block) " / " log-count " rows")
+      (time
+        (insert-log-row dbspec log-name server-num log-entry-block)))
     ))
 
 
 
-(defn -main [f & args]
-  (println "Usage: <command> <FILE>")
-  (println "Processing: " f)
-  (read-tableau-log f))
+(defn -main [ dbspec & args]
+  (doseq [log-file args]
+    (println "Processing: " log-file)
+    (read-tableau-log dbspec log-file)))
